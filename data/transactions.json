@@ -1,0 +1,50 @@
+{
+  "transactions": [
+    {
+      "id": "d34c628d-6ad0-4a90-878b-73097b164729",
+      "date": "2026-09-25",
+      "time": "13:01:06",
+      "customer_name": "Test Customer",
+      "customer_contact": "03001234567",
+      "items": [
+        {
+          "id": "1",
+          "name": "Coffee",
+          "price": 2.5,
+          "qty": 2,
+          "subtotal": 5.0
+        }
+      ],
+      "subtotal": 5.0,
+      "tax_rate": 17.0,
+      "tax": 0.85,
+      "total": 5.85,
+      "payment_method": "Cash",
+      "receipt_file": "receipt_d34c628d-6ad0-4a90-878b-73097b164729.pdf"
+    },
+    {
+      "id": "846278c8-e59f-4e3d-b537-7402aa9025d7",
+      "date": "2026-09-25",
+      "time": "18:29:57",
+      "customer_name": "ahmad",
+      "customer_contact": "",
+      "cashier": "Admin",
+      "items": [
+        {
+          "id": "d6f9a1fe",
+          "name": "PG",
+          "price": 200,
+          "qty": 1,
+          "subtotal": 200
+        }
+      ],
+      "subtotal": 200,
+      "tax_rate": 0.0,
+      "tax": 0.0,
+      "total": 200.0,
+      "payment_method": "Cash",
+      "amount_paid": null,
+      "receipt_file": "receipt_846278c8-e59f-4e3d-b537-7402aa9025d7.pdf"
+    }
+  ]
+}
