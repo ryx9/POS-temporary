@@ -45,6 +45,54 @@
       "payment_method": "Cash",
       "amount_paid": null,
       "receipt_file": "receipt_846278c8-e59f-4e3d-b537-7402aa9025d7.pdf"
+    },
+    {
+      "id": "6d305e1a-501f-4deb-8210-d4134cbc8bcd",
+      "date": "2026-09-25",
+      "time": "19:27:36",
+      "customer_name": "ahmad",
+      "customer_contact": "0120912",
+      "cashier": "Admin",
+      "items": [
+        {
+          "id": "d6f9a1fe",
+          "name": "PG",
+          "price": 200,
+          "qty": 1,
+          "subtotal": 200
+        }
+      ],
+      "subtotal": 200,
+      "tax_rate": 0.0,
+      "tax": 0.0,
+      "total": 200.0,
+      "payment_method": "Cash",
+      "amount_paid": null,
+      "receipt_file": "receipt_6d305e1a-501f-4deb-8210-d4134cbc8bcd.pdf"
+    },
+    {
+      "id": "4c8de74c-01b4-44cd-9334-01611f4181d0",
+      "date": "2026-09-28",
+      "time": "16:57:51",
+      "customer_name": "",
+      "customer_contact": "",
+      "cashier": "Admin",
+      "items": [
+        {
+          "id": "d6f9a1fe",
+          "name": "PG",
+          "price": 200,
+          "qty": 2,
+          "subtotal": 400
+        }
+      ],
+      "subtotal": 400,
+      "tax_rate": 0.0,
+      "tax": 0.0,
+      "total": 400.0,
+      "payment_method": "Cash",
+      "amount_paid": null,
+      "receipt_file": "receipt_4c8de74c-01b4-44cd-9334-01611f4181d0.pdf"
     }
   ]
 }

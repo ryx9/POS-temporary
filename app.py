@@ -24,9 +24,9 @@ CASHIERS_FILE = os.path.join(DATA_DIR, "cashiers.json")
 # Admin password (SHA-256 hashed). Default: "admin123"
 ADMIN_PASS_HASH = hashlib.sha256("admin123".encode()).hexdigest()
 
-SHOP_NAME = "My Shop"
-SHOP_ADDRESS = "123 Main Street"
-SHOP_PHONE = "+92 300 000 0000"
+SHOP_NAME = "DAR-E-ARQAM SCHOOl"
+SHOP_ADDRESS = "583 Q MT"
+SHOP_PHONE = "+92 323 444 7292"
 CURRENCY = "PKR"
 
 RECEIPT_WIDTH = 80
