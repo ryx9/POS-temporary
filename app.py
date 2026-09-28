@@ -196,16 +196,6 @@ def _ensure_collections():
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-RECEIPTS_DIR = os.path.join(
-    BASE_DIR,
-    "receipts",
-)
-
-os.makedirs(
-    RECEIPTS_DIR,
-    exist_ok=True,
-)
-
 
 ADMIN_PASS_HASH = hashlib.sha256("admin123".encode()).hexdigest()
 
@@ -328,12 +318,8 @@ def merge_cart_items(items):
 def generate_receipt(transaction):
     tid = transaction["id"]
 
-    filename = f"receipt_{tid}.pdf"
-
-    filepath = os.path.join(
-        RECEIPTS_DIR,
-        filename,
-    )
+    # Generate the PDF entirely in memory. Nothing is written to disk.
+    buf = BytesIO()
 
     SZ_SHOP = 15
     SZ_SUBHEAD = 9.5
@@ -391,7 +377,7 @@ def generate_receipt(transaction):
     )
 
     c = canvas.Canvas(
-        filepath,
+        buf,
         pagesize=(W, h_pts),
     )
 
@@ -705,8 +691,9 @@ def generate_receipt(transaction):
     )
 
     c.save()
+    buf.seek(0)
 
-    return filename
+    return buf
 
 
 # =============================================================================
@@ -1205,18 +1192,9 @@ def create_transaction():
     # Generate receipt
     # -------------------------------------------------------------------------
 
-    try:
-        receipt_file = generate_receipt(transaction)
-    except Exception as e:
-        log.exception("Failed to generate receipt")
-
-        return jsonify(
-            {
-                "error": (f"Failed to generate receipt: {e}"),
-            }
-        ), 500
-
-    transaction["receipt_file"] = receipt_file
+    # Receipt PDFs are generated on-demand in memory and are NOT stored
+    # in the local filesystem.
+    transaction["receipt_file"] = ""
 
     # -------------------------------------------------------------------------
     # Save transaction
@@ -1237,7 +1215,7 @@ def create_transaction():
         {
             "success": True,
             "transaction": _clean(transaction),
-            "receipt_url": (f"/receipt/{receipt_file}"),
+            "receipt_url": f"/receipt/{transaction['id']}",
         }
     )
 
@@ -1261,19 +1239,30 @@ def get_transactions():
     )
 
 
-@app.route("/receipt/<filename>")
-def serve_receipt(filename):
-    filepath = os.path.join(
-        RECEIPTS_DIR,
-        filename,
-    )
+@app.route("/receipt/<transaction_id>")
+def serve_receipt(transaction_id):
+    transaction = col_transactions.find_one({"id": transaction_id})
 
-    if not os.path.exists(filepath):
+    if not transaction:
         abort(404)
 
+    try:
+        pdf = generate_receipt(transaction)
+    except Exception as e:
+        log.exception("Failed to generate receipt for transaction %s", transaction_id)
+        return jsonify(
+            {
+                "success": False,
+                "error": f"Failed to generate receipt: {e}",
+            }
+        ), 500
+
     return send_file(
-        filepath,
+        pdf,
         mimetype="application/pdf",
+        as_attachment=False,
+        download_name=f"receipt_{transaction_id}.pdf",
+        max_age=0,
     )
 
 
