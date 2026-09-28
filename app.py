@@ -1,5 +1,4 @@
 from flask import Flask, render_template, request, jsonify, send_file, abort
-import json
 import os
 import uuid
 from datetime import datetime
@@ -10,16 +9,32 @@ from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, 
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import mm as mm_unit
 import hashlib
+from dotenv import load_dotenv
+from pymongo import MongoClient, DESCENDING
+from pymongo.errors import DuplicateKeyError
+
+load_dotenv()
 
 app = Flask(__name__)
 
-# ── Config ──────────────────────────────────────────────────────────────────
+# ── MongoDB Config ────────────────────────────────────────────────────────────
+MONGODB_URI = os.environ["MONGODB_URI"]
+
+_client = MongoClient(MONGODB_URI)
+_db = _client["pos_db"]
+
+col_stock = _db["stock"]
+col_transactions = _db["transactions"]
+col_cashiers = _db["cashiers"]
+
+# Unique index on cashier usernames (case-insensitive handled in app logic)
+col_cashiers.create_index("username", unique=True)
+# Unique index on stock item names (case-insensitive key stored separately)
+col_stock.create_index("name_lower", unique=True)
+
+# ── App Config ────────────────────────────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(BASE_DIR, "data")
 RECEIPTS_DIR = os.path.join(BASE_DIR, "receipts")
-STOCK_FILE = os.path.join(DATA_DIR, "stock.json")
-TRANS_FILE = os.path.join(DATA_DIR, "transactions.json")
-CASHIERS_FILE = os.path.join(DATA_DIR, "cashiers.json")
 
 # Admin password (SHA-256 hashed). Default: "admin123"
 ADMIN_PASS_HASH = hashlib.sha256("admin123".encode()).hexdigest()
@@ -29,59 +44,31 @@ SHOP_ADDRESS = "583 Q MT"
 SHOP_PHONE = "+92 323 444 7292"
 CURRENCY = "PKR"
 
-RECEIPT_WIDTH = 80
-RECEIPT_HEIGHT = 150
+RECEIPT_WIDTH = 80  # mm
+RECEIPT_HEIGHT = 100  # mm — fixed page height; content expands below if needed
 
 os.makedirs(RECEIPTS_DIR, exist_ok=True)
 
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
-def load_stock():
-    with open(STOCK_FILE, "r") as f:
-        return json.load(f)
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def _clean(doc):
+    """Remove MongoDB _id before returning to client."""
+    if doc is None:
+        return None
+    doc.pop("_id", None)
+    doc.pop("name_lower", None)
+    return doc
 
 
-def save_stock(data):
-    with open(STOCK_FILE, "w") as f:
-        json.dump(data, f, indent=2)
-
-
-def load_transactions():
-    with open(TRANS_FILE, "r") as f:
-        return json.load(f)
-
-
-def save_transactions(data):
-    with open(TRANS_FILE, "w") as f:
-        json.dump(data, f, indent=2)
-
-
-def load_cashiers():
-    if not os.path.exists(CASHIERS_FILE):
-        default = {"cashiers": []}
-        save_cashiers(default)
-        return default
-    with open(CASHIERS_FILE, "r") as f:
-        return json.load(f)
-
-
-def save_cashiers(data):
-    with open(CASHIERS_FILE, "w") as f:
-        json.dump(data, f, indent=2)
-
-
-def check_admin(password):
+def check_admin(password: str) -> bool:
     return hashlib.sha256(password.encode()).hexdigest() == ADMIN_PASS_HASH
 
 
-def check_cashier(username, password):
-    """Return cashier dict if valid, else None."""
-    cashiers = load_cashiers()
+def check_cashier(username: str, password: str):
+    """Return cashier doc if valid credentials, else None."""
     ph = hashlib.sha256(password.encode()).hexdigest()
-    for c in cashiers["cashiers"]:
-        if c["username"].lower() == username.lower() and c["password_hash"] == ph:
-            return c
-    return None
+    doc = col_cashiers.find_one({"username": username.lower(), "password_hash": ph})
+    return _clean(doc) if doc else None
 
 
 def merge_cart_items(items):
@@ -96,136 +83,193 @@ def merge_cart_items(items):
     return list(merged.values())
 
 
-# ── Receipt PDF (thermal 80mm) ────────────────────────────────────────────────
+# ── Receipt PDF (thermal 80 × 100 mm, larger text) ───────────────────────────
 def generate_receipt(transaction):
     tid = transaction["id"]
     filename = f"receipt_{tid}.pdf"
     filepath = os.path.join(RECEIPTS_DIR, filename)
 
+    # ── Font sizes (bumped up for readability on 80 mm roll) ──
+    SZ_SHOP = 15  # shop name headline
+    SZ_SUBHEAD = 9.5  # address / phone
+    SZ_META = 9  # receipt #, date, cashier, customer
+    SZ_COL_HDR = 9  # column header row
+    SZ_ITEM = 9.5  # item rows
+    SZ_TOTALS = 9.5  # subtotal / tax lines
+    SZ_GRAND = 12  # TOTAL line
+    SZ_PAYMENT = 9.5  # payment method
+    SZ_FOOTER = 9  # thank-you lines
+
+    # Row pitch: generous leading so nothing feels cramped
+    def pitch(size):
+        return (size + 3.5) * 0.352778 * mm_unit
+
     W = RECEIPT_WIDTH * mm_unit
+    M = 4 * mm_unit  # left/right margin
+
+    # ── Estimate total height so the page fits content exactly ──
     n_items = len(transaction["items"])
-    # extra lines for partial payment info
-    extra = 3 if transaction.get("amount_paid") is not None else 0
-    h_pts = max(RECEIPT_HEIGHT, 80 + n_items * 9 + 55 + extra * 5) * mm_unit
+    has_paid = transaction.get("amount_paid") is not None
+    has_tax = bool(transaction.get("tax", 0))
+    has_cash = bool(transaction.get("cashier"))
+    has_cname = bool(transaction.get("customer_name"))
+    has_cphone = bool(transaction.get("customer_contact"))
+
+    # Count text rows in each section
+    hdr_rows = 3 + has_cash + has_cname + has_cphone  # shop + meta
+    item_rows = n_items
+    total_rows = 2 + has_tax + (2 if has_paid else 0)  # subtotal+total+optional
+    footer_rows = 2
+
+    # Rough height (mm): margins + section gaps + rows
+    est_h = (
+        5  # top margin
+        + hdr_rows * (SZ_META * 0.352778 + 1.0)
+        + 10  # two separator lines
+        + 7  # column header + gap
+        + item_rows * (SZ_ITEM * 0.352778 + 1.3)
+        + 8  # separator lines around totals
+        + total_rows * (SZ_TOTALS * 0.352778 + 1.2)
+        + 4  # payment line
+        + footer_rows * (SZ_FOOTER * 0.352778 + 1.0)
+        + 6  # bottom padding
+    )
+    h_pts = max(RECEIPT_HEIGHT, est_h) * mm_unit
 
     c = canvas.Canvas(filepath, pagesize=(W, h_pts))
     y = h_pts - 5 * mm_unit
 
+    # ── Drawing helpers ───────────────────────────────────────
     def draw_line(dashed=False):
         nonlocal y
         c.setDash(2, 2) if dashed else c.setDash()
         c.setLineWidth(0.5)
-        c.line(3 * mm_unit, y, (RECEIPT_WIDTH - 3) * mm_unit, y)
-        y -= 2.5 * mm_unit
+        c.line(M, y, W - M, y)
+        y -= 3 * mm_unit
 
-    def text(txt, size=8, bold=False, center=False, x_off=0):
+    def text(txt, size=9, bold=False, center=False):
         nonlocal y
         c.setFont("Helvetica-Bold" if bold else "Helvetica", size)
-        x = W / 2 if center else (3 * mm_unit + x_off)
         if center:
-            c.drawCentredString(x, y, txt)
+            c.drawCentredString(W / 2, y, txt)
         else:
-            c.drawString(x, y, txt)
-        y -= (size + 2.5) * 0.352778 * mm_unit
+            c.drawString(M, y, txt)
+        y -= pitch(size)
 
-    def right_pair(label, value, bold=False, size=8):
+    def right_pair(label, value, bold=False, size=9.5):
         nonlocal y
-        font = "Helvetica-Bold" if bold else "Helvetica"
-        c.setFont(font, size)
-        c.drawString(3 * mm_unit, y, label)
-        c.drawRightString((RECEIPT_WIDTH - 3) * mm_unit, y, value)
-        y -= (size + 2.5) * 0.352778 * mm_unit
+        c.setFont("Helvetica-Bold" if bold else "Helvetica", size)
+        c.drawString(M, y, label)
+        c.drawRightString(W - M, y, value)
+        y -= pitch(size)
 
-    # ── Header ──
-    text(SHOP_NAME, size=13, bold=True, center=True)
-    text(SHOP_ADDRESS, size=8, center=True)
-    text(SHOP_PHONE, size=8, center=True)
+    def item_row(name, qty, price, subtotal, size=9.5):
+        nonlocal y
+        # columns: name | qty @ 38mm | price @ 49mm | total right-aligned
+        c.setFont("Helvetica", size)
+        c.drawString(M, y, name)
+        c.drawString(38 * mm_unit, y, qty)
+        c.drawString(49 * mm_unit, y, price)
+        c.drawRightString(W - M, y, subtotal)
+        y -= pitch(size)
+
+    # ── Header ────────────────────────────────────────────────
+    text(SHOP_NAME, size=SZ_SHOP, bold=True, center=True)
+    text(SHOP_ADDRESS, size=SZ_SUBHEAD, center=True)
+    text(SHOP_PHONE, size=SZ_SUBHEAD, center=True)
+    y -= 1.5 * mm_unit
+    draw_line()
+
+    text(f"Receipt #: {tid[:8].upper()}", size=SZ_META)
+    text(f"Date: {transaction['date']}  Time: {transaction['time']}", size=SZ_META)
+    if transaction.get("cashier"):
+        text(f"Cashier:  {transaction['cashier']}", size=SZ_META)
+    if transaction.get("customer_name"):
+        text(f"Customer: {transaction['customer_name']}", size=SZ_META)
+    if transaction.get("customer_contact"):
+        text(f"Contact:  {transaction['customer_contact']}", size=SZ_META)
     y -= 1 * mm_unit
     draw_line()
 
-    text(f"Receipt #: {tid[:8].upper()}", size=8)
-    text(f"Date: {transaction['date']}  Time: {transaction['time']}", size=8)
-    if transaction.get("cashier"):
-        text(f"Cashier: {transaction['cashier']}", size=8)
-    if transaction.get("customer_name"):
-        text(f"Customer: {transaction['customer_name']}", size=8)
-    if transaction.get("customer_contact"):
-        text(f"Contact:  {transaction['customer_contact']}", size=8)
-    y -= 0.5 * mm_unit
-    draw_line()
-
-    # ── Column headers ──
-    c.setFont("Helvetica-Bold", 7.5)
-    c.drawString(3 * mm_unit, y, "Item")
-    c.drawString(37 * mm_unit, y, "Qty")
-    c.drawString(47 * mm_unit, y, "Price")
-    c.drawRightString((RECEIPT_WIDTH - 3) * mm_unit, y, "Total")
-    y -= 5 * mm_unit
+    # ── Column headers ────────────────────────────────────────
+    c.setFont("Helvetica-Bold", SZ_COL_HDR)
+    c.drawString(M, y, "Item")
+    c.drawString(38 * mm_unit, y, "Qty")
+    c.drawString(49 * mm_unit, y, "Price")
+    c.drawRightString(W - M, y, "Total")
+    y -= 6 * mm_unit
     draw_line(dashed=True)
 
-    # ── Items ──
+    # ── Item rows ─────────────────────────────────────────────
     for item in transaction["items"]:
-        name = item["name"][:20]
-        qty = str(item["qty"])
-        price = f"{item['price']:.0f}"
-        subtotal = f"{item['subtotal']:.0f}"
-        c.setFont("Helvetica", 8)
-        c.drawString(3 * mm_unit, y, name)
-        c.drawString(37 * mm_unit, y, qty)
-        c.drawString(47 * mm_unit, y, price)
-        c.drawRightString((RECEIPT_WIDTH - 3) * mm_unit, y, subtotal)
-        y -= 5 * mm_unit
+        item_row(
+            item["name"][:22],
+            str(item["qty"]),
+            f"{item['price']:.0f}",
+            f"{item['subtotal']:.0f}",
+            size=SZ_ITEM,
+        )
 
     draw_line(dashed=True)
 
-    # ── Totals ──
+    # ── Totals ────────────────────────────────────────────────
     subtotal_val = transaction["subtotal"]
     tax_val = transaction.get("tax", 0)
     total_val = transaction["total"]
 
-    right_pair("Subtotal:", f"{CURRENCY} {subtotal_val:.0f}")
+    right_pair("Subtotal:", f"{CURRENCY} {subtotal_val:.0f}", size=SZ_TOTALS)
     if tax_val:
         right_pair(
-            f"Tax ({transaction.get('tax_rate', 0)}%):", f"{CURRENCY} {tax_val:.0f}"
+            f"Tax ({transaction.get('tax_rate', 0)}%):",
+            f"{CURRENCY} {tax_val:.0f}",
+            size=SZ_TOTALS,
         )
     draw_line()
-    right_pair("TOTAL:", f"{CURRENCY} {total_val:.0f}", bold=True, size=9)
+    right_pair("TOTAL:", f"{CURRENCY} {total_val:.0f}", bold=True, size=SZ_GRAND)
 
-    y -= 1 * mm_unit
-    text(f"Payment: {transaction.get('payment_method', 'Cash')}", size=8)
+    y -= 1.5 * mm_unit
+    text(f"Payment: {transaction.get('payment_method', 'Cash')}", size=SZ_PAYMENT)
 
-    # ── Partial payment block ──
+    # ── Partial payment block ─────────────────────────────────
     amount_paid = transaction.get("amount_paid")
     if amount_paid is not None:
-        y -= 0.5 * mm_unit
+        y -= 1 * mm_unit
         draw_line(dashed=True)
-        right_pair("Amount Paid:", f"{CURRENCY} {amount_paid:.0f}", bold=True)
+        right_pair(
+            "Amount Paid:", f"{CURRENCY} {amount_paid:.0f}", bold=True, size=SZ_TOTALS
+        )
         balance = amount_paid - total_val
         if balance >= 0:
-            right_pair("Change:", f"{CURRENCY} {balance:.0f}")
+            right_pair("Change:", f"{CURRENCY} {balance:.0f}", size=SZ_TOTALS)
         else:
-            right_pair("Balance Due:", f"{CURRENCY} {abs(balance):.0f}", bold=True)
+            right_pair(
+                "Balance Due:",
+                f"{CURRENCY} {abs(balance):.0f}",
+                bold=True,
+                size=SZ_TOTALS,
+            )
 
-    # ── Footer ──
-    y -= 2 * mm_unit
+    # ── Footer ────────────────────────────────────────────────
+    y -= 2.5 * mm_unit
     draw_line(dashed=True)
-    text("Thank you for your purchase!", size=8, center=True, bold=True)
-    text("Please come again.", size=7.5, center=True)
+    text("Thank you for your purchase!", size=SZ_FOOTER, bold=True, center=True)
+    text("Please come again.", size=SZ_FOOTER, center=True)
 
     c.save()
     return filename
 
 
-# ── Routes ───────────────────────────────────────────────────────────────────
+# ── Routes ────────────────────────────────────────────────────────────────────
 @app.route("/")
 def index():
     return render_template("index.html", shop_name=SHOP_NAME)
 
 
-# Stock
+# ── Stock ─────────────────────────────────────────────────────────────────────
 @app.route("/api/stock", methods=["GET"])
 def get_stock():
-    return jsonify(load_stock())
+    items = [_clean(doc) for doc in col_stock.find()]
+    return jsonify({"items": items})
 
 
 @app.route("/api/stock/add", methods=["POST"])
@@ -235,32 +279,40 @@ def add_stock():
     if not check_admin(password):
         return jsonify({"error": "Invalid admin password"}), 403
 
-    stock = load_stock()
     name = data.get("name", "").strip()
-    for item in stock["items"]:
-        if item["name"].strip().lower() == name.lower():
-            item["stock"] += int(data.get("stock", 0))
-            item["price"] = float(data.get("price", item["price"]))
-            item["category"] = data.get("category", item["category"])
-            save_stock(stock)
-            return jsonify(
-                {
-                    "success": True,
-                    "message": f"Merged with existing item '{item['name']}'",
-                    "item": item,
-                }
-            )
+    name_lower = name.lower()
+
+    existing = col_stock.find_one({"name_lower": name_lower})
+    if existing:
+        col_stock.update_one(
+            {"name_lower": name_lower},
+            {
+                "$inc": {"stock": int(data.get("stock", 0))},
+                "$set": {
+                    "price": float(data.get("price", existing["price"])),
+                    "category": data.get("category", existing["category"]),
+                },
+            },
+        )
+        updated = _clean(col_stock.find_one({"name_lower": name_lower}))
+        return jsonify(
+            {
+                "success": True,
+                "message": f"Merged with existing item '{updated['name']}'",
+                "item": updated,
+            }
+        )
 
     new_item = {
         "id": str(uuid.uuid4())[:8],
         "name": name,
+        "name_lower": name_lower,
         "price": float(data.get("price", 0)),
         "stock": int(data.get("stock", 0)),
         "category": data.get("category", "General"),
     }
-    stock["items"].append(new_item)
-    save_stock(stock)
-    return jsonify({"success": True, "message": "Item added", "item": new_item})
+    col_stock.insert_one(new_item)
+    return jsonify({"success": True, "message": "Item added", "item": _clean(new_item)})
 
 
 @app.route("/api/stock/update", methods=["POST"])
@@ -269,21 +321,27 @@ def update_stock():
     password = data.get("password", "")
     if not check_admin(password):
         return jsonify({"error": "Invalid admin password"}), 403
-    stock = load_stock()
+
     item_id = data.get("id")
-    for item in stock["items"]:
-        if item["id"] == item_id:
-            if "name" in data:
-                item["name"] = data["name"]
-            if "price" in data:
-                item["price"] = float(data["price"])
-            if "stock" in data:
-                item["stock"] = int(data["stock"])
-            if "category" in data:
-                item["category"] = data["category"]
-            save_stock(stock)
-            return jsonify({"success": True, "item": item})
-    return jsonify({"error": "Item not found"}), 404
+    updates = {}
+    if "name" in data:
+        updates["name"] = data["name"]
+        updates["name_lower"] = data["name"].lower()
+    if "price" in data:
+        updates["price"] = float(data["price"])
+    if "stock" in data:
+        updates["stock"] = int(data["stock"])
+    if "category" in data:
+        updates["category"] = data["category"]
+
+    result = col_stock.find_one_and_update(
+        {"id": item_id},
+        {"$set": updates},
+        return_document=True,
+    )
+    if not result:
+        return jsonify({"error": "Item not found"}), 404
+    return jsonify({"success": True, "item": _clean(result)})
 
 
 @app.route("/api/stock/delete", methods=["POST"])
@@ -292,55 +350,45 @@ def delete_stock():
     password = data.get("password", "")
     if not check_admin(password):
         return jsonify({"error": "Invalid admin password"}), 403
-    stock = load_stock()
-    item_id = data.get("id")
-    before = len(stock["items"])
-    stock["items"] = [i for i in stock["items"] if i["id"] != item_id]
-    if len(stock["items"]) == before:
+
+    result = col_stock.delete_one({"id": data.get("id")})
+    if result.deleted_count == 0:
         return jsonify({"error": "Item not found"}), 404
-    save_stock(stock)
     return jsonify({"success": True})
 
 
-# Transactions
+# ── Transactions ──────────────────────────────────────────────────────────────
 @app.route("/api/transaction", methods=["POST"])
 def create_transaction():
     data = request.json
-    stock = load_stock()
-    trans = load_transactions()
-
     cart_items = data.get("items", [])
     if not cart_items:
         return jsonify({"error": "Cart is empty"}), 400
 
     cart_items = merge_cart_items(cart_items)
 
+    # Validate stock
     for cart_item in cart_items:
-        found = False
-        for stock_item in stock["items"]:
-            if stock_item["id"] == cart_item["id"]:
-                found = True
-                if stock_item["stock"] < cart_item["qty"]:
-                    return jsonify(
-                        {"error": f"Insufficient stock for '{stock_item['name']}'"}
-                    ), 400
-                break
-        if not found:
+        stock_item = col_stock.find_one({"id": cart_item["id"]})
+        if not stock_item:
             return jsonify({"error": f"Item '{cart_item['name']}' not found"}), 404
+        if stock_item["stock"] < cart_item["qty"]:
+            return jsonify(
+                {"error": f"Insufficient stock for '{stock_item['name']}'"}
+            ), 400
 
+    # Deduct stock
     for cart_item in cart_items:
-        for stock_item in stock["items"]:
-            if stock_item["id"] == cart_item["id"]:
-                stock_item["stock"] -= cart_item["qty"]
-                break
+        col_stock.update_one(
+            {"id": cart_item["id"]},
+            {"$inc": {"stock": -cart_item["qty"]}},
+        )
 
     now = datetime.now()
     tax_rate = float(data.get("tax_rate", 0))
     subtotal = sum(i["subtotal"] for i in cart_items)
     tax = round(subtotal * tax_rate / 100, 2)
     total = round(subtotal + tax, 2)
-
-    # Partial payment
     amount_paid_raw = data.get("amount_paid")
     amount_paid = float(amount_paid_raw) if amount_paid_raw is not None else None
 
@@ -364,14 +412,12 @@ def create_transaction():
     receipt_file = generate_receipt(transaction)
     transaction["receipt_file"] = receipt_file
 
-    trans["transactions"].append(transaction)
-    save_transactions(trans)
-    save_stock(stock)
+    col_transactions.insert_one(transaction)
 
     return jsonify(
         {
             "success": True,
-            "transaction": transaction,
+            "transaction": _clean(dict(transaction)),
             "receipt_url": f"/receipt/{receipt_file}",
         }
     )
@@ -379,11 +425,13 @@ def create_transaction():
 
 @app.route("/api/transactions", methods=["GET"])
 def get_transactions():
-    trans = load_transactions()
-    trans["transactions"] = sorted(
-        trans["transactions"], key=lambda x: x["date"] + x["time"], reverse=True
-    )
-    return jsonify(trans)
+    docs = [
+        _clean(doc)
+        for doc in col_transactions.find().sort(
+            [("date", DESCENDING), ("time", DESCENDING)]
+        )
+    ]
+    return jsonify({"transactions": docs})
 
 
 @app.route("/receipt/<filename>")
@@ -405,19 +453,18 @@ def verify_admin():
 # ── Cashier management (admin only) ──────────────────────────────────────────
 @app.route("/api/cashiers", methods=["GET"])
 def get_cashiers():
-    data = request.json or {}
-    password = data.get("password", request.args.get("password", ""))
+    body = request.json or {}
+    password = body.get("password", request.args.get("password", ""))
     if not check_admin(password):
         return jsonify({"error": "Admin only"}), 403
-    cashiers = load_cashiers()
-    # strip password hashes before returning
+
     safe = [
         {
             "id": c["id"],
             "username": c["username"],
             "display_name": c.get("display_name", ""),
         }
-        for c in cashiers["cashiers"]
+        for c in col_cashiers.find()
     ]
     return jsonify({"cashiers": safe})
 
@@ -428,23 +475,25 @@ def add_cashier():
     password = data.get("password", "")
     if not check_admin(password):
         return jsonify({"error": "Admin only"}), 403
+
     username = data.get("username", "").strip()
     new_password = data.get("new_password", "").strip()
     display_name = data.get("display_name", username).strip()
+
     if not username or not new_password:
         return jsonify({"error": "Username and password required"}), 400
-    cashiers = load_cashiers()
-    if any(c["username"].lower() == username.lower() for c in cashiers["cashiers"]):
+
+    new_cashier = {
+        "id": str(uuid.uuid4())[:8],
+        "username": username.lower(),
+        "display_name": display_name,
+        "password_hash": hashlib.sha256(new_password.encode()).hexdigest(),
+    }
+    try:
+        col_cashiers.insert_one(new_cashier)
+    except DuplicateKeyError:
         return jsonify({"error": "Username already exists"}), 409
-    cashiers["cashiers"].append(
-        {
-            "id": str(uuid.uuid4())[:8],
-            "username": username,
-            "display_name": display_name,
-            "password_hash": hashlib.sha256(new_password.encode()).hexdigest(),
-        }
-    )
-    save_cashiers(cashiers)
+
     return jsonify({"success": True, "message": f"Cashier '{username}' added"})
 
 
@@ -454,13 +503,10 @@ def delete_cashier():
     password = data.get("password", "")
     if not check_admin(password):
         return jsonify({"error": "Admin only"}), 403
-    cid = data.get("id")
-    cashiers = load_cashiers()
-    before = len(cashiers["cashiers"])
-    cashiers["cashiers"] = [c for c in cashiers["cashiers"] if c["id"] != cid]
-    if len(cashiers["cashiers"]) == before:
+
+    result = col_cashiers.delete_one({"id": data.get("id")})
+    if result.deleted_count == 0:
         return jsonify({"error": "Cashier not found"}), 404
-    save_cashiers(cashiers)
     return jsonify({"success": True})
 
 
@@ -469,7 +515,7 @@ def cashier_login():
     data = request.json
     username = data.get("username", "")
     password = data.get("password", "")
-    # Admin can also log in as "cashier"
+
     if check_admin(password) and username.lower() == "admin":
         return jsonify(
             {
@@ -481,6 +527,7 @@ def cashier_login():
                 },
             }
         )
+
     cashier = check_cashier(username, password)
     if cashier:
         return jsonify(
@@ -503,15 +550,17 @@ def generate_report():
     date_from = data.get("date_from", "")
     date_to = data.get("date_to", "")
 
-    trans = load_transactions()
-    rows = trans["transactions"]
+    query = {}
+    if date_from and date_to:
+        query["date"] = {"$gte": date_from, "$lte": date_to}
+    elif date_from:
+        query["date"] = {"$gte": date_from}
+    elif date_to:
+        query["date"] = {"$lte": date_to}
 
-    if date_from:
-        rows = [t for t in rows if t["date"] >= date_from]
-    if date_to:
-        rows = [t for t in rows if t["date"] <= date_to]
-
-    rows = sorted(rows, key=lambda x: x["date"] + x["time"])
+    rows = list(col_transactions.find(query).sort([("date", 1), ("time", 1)]))
+    for r in rows:
+        r.pop("_id", None)
 
     from io import BytesIO
     from reportlab.lib.pagesizes import A4
@@ -690,22 +739,19 @@ def generate_report():
             ]
         )
 
-    # Keep the transaction table strictly inside the printable A4 width.
-    # Printable width = A4 width - left/right margins = 18 cm.
-    # The previous widths totaled 23.6 cm, causing horizontal overflow.
     col_w = [
-        0.45 * cm,  # #
-        1.35 * cm,  # Date
-        1.05 * cm,  # Time
-        1.20 * cm,  # Cashier
-        1.55 * cm,  # Customer
-        2.65 * cm,  # Items
-        1.25 * cm,  # Subtotal
-        1.05 * cm,  # Tax
-        1.25 * cm,  # Total
-        1.35 * cm,  # Payment
-        1.35 * cm,  # Paid
-        1.50 * cm,  # Balance
+        0.45 * cm,
+        1.35 * cm,
+        1.05 * cm,
+        1.20 * cm,
+        1.55 * cm,
+        2.65 * cm,
+        1.25 * cm,
+        1.05 * cm,
+        1.25 * cm,
+        1.35 * cm,
+        1.35 * cm,
+        1.50 * cm,
     ]
     tx_table = Table(tx_rows, colWidths=col_w, repeatRows=1)
     tx_table.setStyle(

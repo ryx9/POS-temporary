@@ -1,0 +1,4 @@
+flask
+reportlab
+pymongo[srv]
+python-dotenv
