@@ -10,27 +10,70 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import mm as mm_unit
 import hashlib
 from dotenv import load_dotenv
-from pymongo import MongoClient, DESCENDING
-from pymongo.errors import DuplicateKeyError
+from pymongo import MongoClient, DESCENDING, TEXT
+from pymongo.errors import DuplicateKeyError, CollectionInvalid
+import logging
 
 load_dotenv()
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
 # ── MongoDB Config ────────────────────────────────────────────────────────────
-MONGODB_URI = os.environ["MONGODB_URI"]
+MONGODB_URI = os.environ.get("MONGODB_URI", "mongodb://localhost:27017")
 
-_client = MongoClient(MONGODB_URI)
+# connect=False defers TCP handshake to first real operation → instant startup
+_client = MongoClient(
+    MONGODB_URI,
+    connectTimeoutMS=5000,
+    serverSelectionTimeoutMS=5000,
+    connect=False,  # ← key: no blocking at import time
+)
 _db = _client["pos_db"]
 
 col_stock = _db["stock"]
 col_transactions = _db["transactions"]
 col_cashiers = _db["cashiers"]
 
-# Unique index on cashier usernames (case-insensitive handled in app logic)
-col_cashiers.create_index("username", unique=True)
-# Unique index on stock item names (case-insensitive key stored separately)
-col_stock.create_index("name_lower", unique=True)
+
+def _ensure_collections():
+    """
+    Create collections explicitly if they don't exist, then create all
+    required indexes.  Safe to call multiple times (create_index is idempotent,
+    and we guard collection creation with a try/except).
+    """
+    existing = _db.list_collection_names()
+
+    for name in ("stock", "transactions", "cashiers"):
+        if name not in existing:
+            try:
+                _db.create_collection(name)
+                log.info("Created collection: %s", name)
+            except CollectionInvalid:
+                pass  # another process beat us to it — that's fine
+
+    # ── Indexes ──────────────────────────────────────────────────────────────
+    # cashiers
+    col_cashiers.create_index("username", unique=True, name="idx_cashier_username")
+    col_cashiers.create_index("id", unique=True, name="idx_cashier_id", sparse=True)
+
+    # stock
+    col_stock.create_index("name_lower", unique=True, name="idx_stock_name_lower")
+    col_stock.create_index("id", unique=True, name="idx_stock_id", sparse=True)
+    col_stock.create_index("category", name="idx_stock_category")
+
+    # transactions — sorted queries and range filters
+    col_transactions.create_index(
+        [("date", DESCENDING), ("time", DESCENDING)],
+        name="idx_tx_date_time",
+    )
+    col_transactions.create_index("id", unique=True, name="idx_tx_id", sparse=True)
+    col_transactions.create_index("date", name="idx_tx_date")
+
+    log.info("DB collections and indexes verified.")
+
 
 # ── App Config ────────────────────────────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -45,14 +88,14 @@ SHOP_PHONE = "+92 323 444 7292"
 CURRENCY = "PKR"
 
 RECEIPT_WIDTH = 80  # mm
-RECEIPT_HEIGHT = 100  # mm — fixed page height; content expands below if needed
+RECEIPT_HEIGHT = 100  # mm — minimum page height; expands with content
 
 os.makedirs(RECEIPTS_DIR, exist_ok=True)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def _clean(doc):
-    """Remove MongoDB _id before returning to client."""
+    """Remove MongoDB internal fields before returning to client."""
     if doc is None:
         return None
     doc.pop("_id", None)
@@ -65,7 +108,7 @@ def check_admin(password: str) -> bool:
 
 
 def check_cashier(username: str, password: str):
-    """Return cashier doc if valid credentials, else None."""
+    """Return cashier doc if credentials are valid, else None."""
     ph = hashlib.sha256(password.encode()).hexdigest()
     doc = col_cashiers.find_one({"username": username.lower(), "password_hash": ph})
     return _clean(doc) if doc else None
@@ -83,63 +126,55 @@ def merge_cart_items(items):
     return list(merged.values())
 
 
-# ── Receipt PDF (thermal 80 × 100 mm, larger text) ───────────────────────────
+# ── Receipt PDF (thermal 80 × 100 mm) ────────────────────────────────────────
 def generate_receipt(transaction):
     tid = transaction["id"]
     filename = f"receipt_{tid}.pdf"
     filepath = os.path.join(RECEIPTS_DIR, filename)
 
-    # ── Font sizes (bumped up for readability on 80 mm roll) ──
-    SZ_SHOP = 15  # shop name headline
-    SZ_SUBHEAD = 9.5  # address / phone
-    SZ_META = 9  # receipt #, date, cashier, customer
-    SZ_COL_HDR = 9  # column header row
-    SZ_ITEM = 9.5  # item rows
-    SZ_TOTALS = 9.5  # subtotal / tax lines
-    SZ_GRAND = 12  # TOTAL line
-    SZ_PAYMENT = 9.5  # payment method
-    SZ_FOOTER = 9  # thank-you lines
+    SZ_SHOP = 15
+    SZ_SUBHEAD = 9.5
+    SZ_META = 9
+    SZ_COL_HDR = 9
+    SZ_ITEM = 9.5
+    SZ_TOTALS = 9.5
+    SZ_GRAND = 12
+    SZ_PAYMENT = 9.5
+    SZ_FOOTER = 9
 
-    # Row pitch: generous leading so nothing feels cramped
     def pitch(size):
         return (size + 3.5) * 0.352778 * mm_unit
 
     W = RECEIPT_WIDTH * mm_unit
-    M = 4 * mm_unit  # left/right margin
+    M = 4 * mm_unit
 
-    # ── Estimate total height so the page fits content exactly ──
     n_items = len(transaction["items"])
     has_paid = transaction.get("amount_paid") is not None
     has_tax = bool(transaction.get("tax", 0))
     has_cash = bool(transaction.get("cashier"))
     has_cname = bool(transaction.get("customer_name"))
-    has_cphone = bool(transaction.get("customer_contact"))
+    has_cph = bool(transaction.get("customer_contact"))
 
-    # Count text rows in each section
-    hdr_rows = 3 + has_cash + has_cname + has_cphone  # shop + meta
-    item_rows = n_items
-    total_rows = 2 + has_tax + (2 if has_paid else 0)  # subtotal+total+optional
-    footer_rows = 2
+    hdr_rows = 3 + has_cash + has_cname + has_cph
+    total_rows = 2 + has_tax + (2 if has_paid else 0)
 
-    # Rough height (mm): margins + section gaps + rows
     est_h = (
-        5  # top margin
+        5
         + hdr_rows * (SZ_META * 0.352778 + 1.0)
-        + 10  # two separator lines
-        + 7  # column header + gap
-        + item_rows * (SZ_ITEM * 0.352778 + 1.3)
-        + 8  # separator lines around totals
+        + 10
+        + 7
+        + n_items * (SZ_ITEM * 0.352778 + 1.3)
+        + 8
         + total_rows * (SZ_TOTALS * 0.352778 + 1.2)
-        + 4  # payment line
-        + footer_rows * (SZ_FOOTER * 0.352778 + 1.0)
-        + 6  # bottom padding
+        + 4
+        + 2 * (SZ_FOOTER * 0.352778 + 1.0)
+        + 6
     )
     h_pts = max(RECEIPT_HEIGHT, est_h) * mm_unit
 
     c = canvas.Canvas(filepath, pagesize=(W, h_pts))
     y = h_pts - 5 * mm_unit
 
-    # ── Drawing helpers ───────────────────────────────────────
     def draw_line(dashed=False):
         nonlocal y
         c.setDash(2, 2) if dashed else c.setDash()
@@ -165,7 +200,6 @@ def generate_receipt(transaction):
 
     def item_row(name, qty, price, subtotal, size=9.5):
         nonlocal y
-        # columns: name | qty @ 38mm | price @ 49mm | total right-aligned
         c.setFont("Helvetica", size)
         c.drawString(M, y, name)
         c.drawString(38 * mm_unit, y, qty)
@@ -173,7 +207,7 @@ def generate_receipt(transaction):
         c.drawRightString(W - M, y, subtotal)
         y -= pitch(size)
 
-    # ── Header ────────────────────────────────────────────────
+    # Header
     text(SHOP_NAME, size=SZ_SHOP, bold=True, center=True)
     text(SHOP_ADDRESS, size=SZ_SUBHEAD, center=True)
     text(SHOP_PHONE, size=SZ_SUBHEAD, center=True)
@@ -191,7 +225,6 @@ def generate_receipt(transaction):
     y -= 1 * mm_unit
     draw_line()
 
-    # ── Column headers ────────────────────────────────────────
     c.setFont("Helvetica-Bold", SZ_COL_HDR)
     c.drawString(M, y, "Item")
     c.drawString(38 * mm_unit, y, "Qty")
@@ -200,7 +233,6 @@ def generate_receipt(transaction):
     y -= 6 * mm_unit
     draw_line(dashed=True)
 
-    # ── Item rows ─────────────────────────────────────────────
     for item in transaction["items"]:
         item_row(
             item["name"][:22],
@@ -212,7 +244,6 @@ def generate_receipt(transaction):
 
     draw_line(dashed=True)
 
-    # ── Totals ────────────────────────────────────────────────
     subtotal_val = transaction["subtotal"]
     tax_val = transaction.get("tax", 0)
     total_val = transaction["total"]
@@ -230,7 +261,6 @@ def generate_receipt(transaction):
     y -= 1.5 * mm_unit
     text(f"Payment: {transaction.get('payment_method', 'Cash')}", size=SZ_PAYMENT)
 
-    # ── Partial payment block ─────────────────────────────────
     amount_paid = transaction.get("amount_paid")
     if amount_paid is not None:
         y -= 1 * mm_unit
@@ -249,7 +279,6 @@ def generate_receipt(transaction):
                 size=SZ_TOTALS,
             )
 
-    # ── Footer ────────────────────────────────────────────────
     y -= 2.5 * mm_unit
     draw_line(dashed=True)
     text("Thank you for your purchase!", size=SZ_FOOTER, bold=True, center=True)
@@ -367,7 +396,6 @@ def create_transaction():
 
     cart_items = merge_cart_items(cart_items)
 
-    # Validate stock
     for cart_item in cart_items:
         stock_item = col_stock.find_one({"id": cart_item["id"]})
         if not stock_item:
@@ -377,7 +405,6 @@ def create_transaction():
                 {"error": f"Insufficient stock for '{stock_item['name']}'"}
             ), 400
 
-    # Deduct stock
     for cart_item in cart_items:
         col_stock.update_one(
             {"id": cart_item["id"]},
@@ -411,7 +438,6 @@ def create_transaction():
 
     receipt_file = generate_receipt(transaction)
     transaction["receipt_file"] = receipt_file
-
     col_transactions.insert_one(transaction)
 
     return jsonify(
@@ -450,7 +476,7 @@ def verify_admin():
     return jsonify({"error": "Invalid password"}), 403
 
 
-# ── Cashier management (admin only) ──────────────────────────────────────────
+# ── Cashier management ────────────────────────────────────────────────────────
 @app.route("/api/cashiers", methods=["GET"])
 def get_cashiers():
     body = request.json or {}
@@ -546,6 +572,10 @@ def cashier_login():
 # ── Transaction Report (A4 PDF) ───────────────────────────────────────────────
 @app.route("/api/report", methods=["POST"])
 def generate_report():
+    from io import BytesIO
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.units import cm
+
     data = request.json
     date_from = data.get("date_from", "")
     date_to = data.get("date_to", "")
@@ -561,10 +591,6 @@ def generate_report():
     rows = list(col_transactions.find(query).sort([("date", 1), ("time", 1)]))
     for r in rows:
         r.pop("_id", None)
-
-    from io import BytesIO
-    from reportlab.lib.pagesizes import A4
-    from reportlab.lib.units import cm
 
     buf = BytesIO()
     doc = SimpleDocTemplate(
@@ -607,7 +633,9 @@ def generate_report():
     story.append(Paragraph(f"{SHOP_NAME} — Transaction Report", title_s))
     story.append(
         Paragraph(
-            f"Period: {date_range_str}   |   Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}   |   Currency: {CURRENCY}",
+            f"Period: {date_range_str}   |   "
+            f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}   |   "
+            f"Currency: {CURRENCY}",
             sub_s,
         )
     )
@@ -628,7 +656,7 @@ def generate_report():
     total_revenue = sum(t["total"] for t in rows)
     total_subtotal = sum(t["subtotal"] for t in rows)
     total_tax = sum(t.get("tax", 0) for t in rows)
-    payment_counts = {}
+    payment_counts: dict = {}
     for t in rows:
         pm = t.get("payment_method", "Cash")
         payment_counts[pm] = payment_counts.get(pm, 0) + 1
@@ -698,7 +726,6 @@ def generate_report():
     )
     story.append(Spacer(1, 8))
     story.append(pm_table)
-
     story.append(Paragraph("Transaction Detail", h3_s))
 
     tx_header = [
@@ -817,5 +844,12 @@ def generate_report():
     )
 
 
+# ── Startup ───────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    _ensure_collections()
     app.run(debug=True, port=5000)
+else:
+    # When run via gunicorn / uwsgi the __main__ block is skipped,
+    # so we still set up DB inside the application context.
+    with app.app_context():
+        _ensure_collections()
